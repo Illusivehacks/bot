@@ -1,84 +1,175 @@
-const baileys = require("@whiskeysockets/baileys");
-const readline = require('readline');
+const { useMultiFileAuthState, makeInMemoryStore, Browsers, delay, getAggregateVotesInPollMessage, proto } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const pino = require('pino');
+const NodeCache = require('node-cache');
+const crypto = require('crypto');
+const { randomBytes } = crypto;
+const { bytesToCrockford } = require('@whiskeysockets/baileys/lib/Utils');
 
-const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-});
+// Initialize logger
+const logger = pino({ level: 'silent' });
 
-async function startBot() {
-    // First, ask for the WhatsApp number
-    rl.question('Enter the WhatsApp account number (with country code, e.g., 911234567890) to link the bot: ', async (number) => {
-        if (!number.match(/^\d+$/)) {
-            console.log('❌ Invalid format! Please enter digits only (including country code). Example: 911234567890');
-            rl.close();
-            process.exit(1);
+// Session store
+const store = makeInMemoryStore({ logger });
+store?.readFromFile('./baileys_store_multi.json');
+setInterval(() => {
+    store?.writeToFile('./baileys_store_multi.json');
+}, 10_000);
+
+// Main bot function
+async function startWhatsAppBot() {
+    // Load authentication state
+    const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
+    
+    // Initialize the WhatsApp client
+    const sock = makeWASocket({
+        logger,
+        printQRInTerminal: false, // We'll use pairing code instead of QR
+        auth: state,
+        browser: Browsers.ubuntu('Chrome'), // Change as needed
+        getMessage: async (key) => {
+            return store.loadMessage(key.remoteJid, key.id) || {};
+        }
+    });
+
+    // Handle pairing code generation
+    async function requestPairingCode(phoneNumber, pairKey) {
+        if (pairKey) {
+            state.creds.pairingCode = pairKey.toUpperCase();
+        } else {
+            state.creds.pairingCode = bytesToCrockford(randomBytes(5));
         }
 
-        const jid = `${number}@s.whatsapp.net`;
-        console.log(`\n🔗 Preparing to link bot to: ${jid}\n`);
+        state.creds.me = {
+            id: phoneNumber.includes('@') ? phoneNumber : `${phoneNumber}@s.whatsapp.net`,
+            name: 'WhatsApp Bot'
+        };
 
-        // Auth setup
-        const { state, saveCreds } = await baileys.useMultiFileAuthState('./auth_info');
-        
-        // Create socket with pairing configuration
-        const sock = baileys.makeWASocket({
-            auth: state,
-            printQRInTerminal: false,
-            mobile: false, // Important for pairing code
-            shouldSyncHistoryMessage: () => true,
-        });
-        
-        // Save credentials
-        sock.ev.on('creds.update', saveCreds);
-        
-        // Handle pairing code event
-        sock.ev.on('connection.update', async (update) => {
-            const { connection, pairingCode } = update;
-            
-            if (pairingCode) {
-                console.log(`╔══════════════════════════╗`);
-                console.log(`║    PAIRING CODE: ${pairingCode}    ║`);
-                console.log(`╚══════════════════════════╝`);
-                console.log("\n📱 Link this bot to your WhatsApp account:");
-                console.log("1. Open WhatsApp > Settings > Linked Devices");
-                console.log("2. Tap 'Link a Device' > 'Pair with code'");
-                console.log("3. Enter the code above");
-                console.log(`\n⏳ Waiting for ${jid} to link...`);
-            }
-            
-            if (connection === 'open') {
-                console.log('\n✅ Successfully linked! Bot is ready.');
-                rl.close();
-            }
-            
-            if (connection === 'close') {
-                console.log("❌ Connection closed, reconnecting...");
-                startBot();
-            }
-        });
-        
-        // Message handler
-        sock.ev.on('messages.upsert', ({ messages }) => {
-            const msg = messages[0];
-            if (!msg.message) return;
-            
-            const text = msg.message.conversation || '';
-            const sender = msg.key.remoteJid;
-            
-            if (text.toLowerCase() === '!ping') {
-                sock.sendMessage(sender, { text: 'Pong! 🏓' });
-            }
-        });
+        await sock.ev.emit('creds.update', state.creds);
 
-        // Cleanup on exit
-        process.on('SIGINT', () => {
-            console.log('\n🛑 Shutting down...');
-            sock.end();
-            rl.close();
-            process.exit();
+        await sock.sendNode({
+            tag: 'iq',
+            attrs: {
+                to: '@s.whatsapp.net',
+                type: 'set',
+                id: sock.generateMessageTag(),
+                xmlns: 'md'
+            },
+            content: [{
+                tag: 'link_code_companion_reg',
+                attrs: {
+                    jid: state.creds.me.id,
+                    stage: 'companion_hello',
+                    should_show_push_notification: 'true'
+                },
+                content: [
+                    {
+                        tag: 'link_code_pairing_wrapped_companion_ephemeral_pub',
+                        attrs: {},
+                        content: await sock.generatePairingKey()
+                    },
+                    {
+                        tag: 'companion_server_auth_key_pub',
+                        attrs: {},
+                        content: state.creds.noiseKey.public
+                    },
+                    {
+                        tag: 'companion_platform_id',
+                        attrs: {},
+                        content: Buffer.from([sock.getPlatformId(sock.browser[1])])
+                    },
+                    {
+                        tag: 'companion_platform_display',
+                        attrs: {},
+                        content: Buffer.from(`${sock.browser[1]} (${sock.browser[0]})`)
+                    },
+                    {
+                        tag: 'link_code_pairing_nonce',
+                        attrs: {},
+                        content: Buffer.from([0])
+                    }
+                ]
+            }]
         });
+        
+        return state.creds.pairingCode;
+    }
+
+    // Handle authentication updates
+    sock.ev.on('creds.update', saveCreds);
+
+    // Load messages to store
+    store.bind(sock.ev);
+
+    // Connection events
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update || {};
+        
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== 401;
+            console.log('Connection closed due to ', lastDisconnect.error, ', reconnecting ', shouldReconnect);
+            
+            if (shouldReconnect) {
+                startWhatsAppBot();
+            }
+        } else if (connection === 'open') {
+            console.log('Successfully connected!');
+        } else if (qr) {
+            console.log('QR code generated, but we\'re using pairing codes instead');
+        }
     });
+
+    // Pairing events
+    sock.ev.on('pairing.success', async (data) => {
+        console.log(`Pairing successful with ${data.phone}`);
+        console.log('You can now send and receive messages!');
+    });
+
+    // Message handler
+    sock.ev.on('messages.upsert', async (m) => {
+        const msg = m.messages[0];
+        if (!msg.message || m.type !== 'notify') return;
+
+        const messageType = Object.keys(msg.message)[0];
+        const text = messageType === 'conversation' 
+            ? msg.message.conversation 
+            : messageType === 'extendedTextMessage' 
+                ? msg.message.extendedTextMessage.text 
+                : '';
+
+        if (text) {
+            const sender = msg.key.remoteJid;
+            console.log(`Received message from ${sender}: ${text}`);
+
+            // Simple echo bot
+            if (text.toLowerCase() === 'ping') {
+                await sock.sendMessage(sender, { text: 'Pong!' });
+            }
+            
+            // Send pairing code if requested
+            if (text.toLowerCase() === '!pair') {
+                const pairingCode = await requestPairingCode(state.creds.me?.id || '254743844485@s.whatsapp.net');
+                await sock.sendMessage(sender, { 
+                    text: `Your pairing code is: ${pairingCode}\n\nEnter this in your WhatsApp app under Linked Devices to connect.`
+                });
+            }
+        }
+    });
+
+    // Start the bot with pairing code
+    try {
+        const phoneNumber = process.env.PHONE_NUMBER || '1234567890@s.whatsapp.net'; // Replace with your number
+        const pairingCode = await requestPairingCode(phoneNumber);
+        
+        console.log('==========================================');
+        console.log(`Your pairing code is: ${pairingCode}`);
+        console.log('Go to WhatsApp > Settings > Linked Devices > Link a Device');
+        console.log('Enter this code to connect your bot');
+        console.log('==========================================');
+    } catch (error) {
+        console.error('Error during pairing:', error);
+    }
 }
 
-startBot().catch(err => console.log("🔥 Error:", err));
+// Start the bot
+startWhatsAppBot().catch(err => console.log('Unexpected error:', err));
