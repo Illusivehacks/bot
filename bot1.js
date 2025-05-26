@@ -1,4 +1,4 @@
-const { useMultiFileAuthState, makeInMemoryStore, Browsers, delay, getAggregateVotesInPollMessage, proto } = require('@whiskeysockets/baileys');
+const { useMultiFileAuthState, makeInMemoryStore, Browsers, delay, getAggregateVotesInPollMessage, proto, makeWASocket } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const NodeCache = require('node-cache');
@@ -106,8 +106,8 @@ async function startWhatsAppBot() {
         const { connection, lastDisconnect, qr } = update || {};
         
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== 401;
-            console.log('Connection closed due to ', lastDisconnect.error, ', reconnecting ', shouldReconnect);
+            const shouldReconnect = (lastDisconnect?.error?.output?.statusCode !== 401);
+            console.log('Connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
             
             if (shouldReconnect) {
                 startWhatsAppBot();
@@ -148,7 +148,7 @@ async function startWhatsAppBot() {
             
             // Send pairing code if requested
             if (text.toLowerCase() === '!pair') {
-                const pairingCode = await requestPairingCode(state.creds.me?.id || '254743844485@s.whatsapp.net');
+                const pairingCode = await requestPairingCode(state.creds.me?.id || '1234567890@s.whatsapp.net');
                 await sock.sendMessage(sender, { 
                     text: `Your pairing code is: ${pairingCode}\n\nEnter this in your WhatsApp app under Linked Devices to connect.`
                 });
@@ -158,7 +158,7 @@ async function startWhatsAppBot() {
 
     // Start the bot with pairing code
     try {
-        const phoneNumber = process.env.PHONE_NUMBER || '1234567890@s.whatsapp.net'; // Replace with your number
+        const phoneNumber = process.env.PHONE_NUMBER || '254743844485@s.whatsapp.net'; // Replace with your number
         const pairingCode = await requestPairingCode(phoneNumber);
         
         console.log('==========================================');
