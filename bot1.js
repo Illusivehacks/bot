@@ -1,19 +1,24 @@
-const { useMultiFileAuthState, makeInMemoryStore, Browsers, delay, getAggregateVotesInPollMessage, proto, makeWASocket } = require('@whiskeysockets/baileys');
+const { 
+    useMultiFileAuthState, 
+    makeInMemoryStore, 
+    makeWASocket, 
+    Browsers, 
+    delay, 
+    DEFAULT_CONNECTION_CONFIG 
+} = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
-const NodeCache = require('node-cache');
 const crypto = require('crypto');
 const { randomBytes } = crypto;
-const { bytesToCrockford } = require('@whiskeysockets/baileys/lib/Utils');
 
 // Initialize logger
 const logger = pino({ level: 'silent' });
 
 // Session store
 const store = makeInMemoryStore({ logger });
-store?.readFromFile('./baileys_store_multi.json');
+store.readFromFile('./baileys_store_multi.json');
 setInterval(() => {
-    store?.writeToFile('./baileys_store_multi.json');
+    store.writeToFile('./baileys_store_multi.json');
 }, 10_000);
 
 // Main bot function
@@ -28,7 +33,10 @@ async function startWhatsAppBot() {
         auth: state,
         browser: Browsers.ubuntu('Chrome'), // Change as needed
         getMessage: async (key) => {
-            return store.loadMessage(key.remoteJid, key.id) || {};
+            if (store) {
+                return store.loadMessage(key.remoteJid, key.id) || {};
+            }
+            return {};
         }
     });
 
@@ -37,7 +45,13 @@ async function startWhatsAppBot() {
         if (pairKey) {
             state.creds.pairingCode = pairKey.toUpperCase();
         } else {
-            state.creds.pairingCode = bytesToCrockford(randomBytes(5));
+            // Generate random 5-byte pairing code in Crockford's Base32
+            const random = randomBytes(5);
+            state.creds.pairingCode = Array.from(random)
+                .map(byte => byte.toString(32))
+                .join('')
+                .toUpperCase()
+                .substring(0, 8);
         }
 
         state.creds.me = {
@@ -45,7 +59,7 @@ async function startWhatsAppBot() {
             name: 'WhatsApp Bot'
         };
 
-        await sock.ev.emit('creds.update', state.creds);
+        sock.ev.emit('creds.update', state.creds);
 
         await sock.sendNode({
             tag: 'iq',
@@ -66,7 +80,7 @@ async function startWhatsAppBot() {
                     {
                         tag: 'link_code_pairing_wrapped_companion_ephemeral_pub',
                         attrs: {},
-                        content: await sock.generatePairingKey()
+                        content: (await sock.generatePairingKey()).public
                     },
                     {
                         tag: 'companion_server_auth_key_pub',
@@ -76,12 +90,12 @@ async function startWhatsAppBot() {
                     {
                         tag: 'companion_platform_id',
                         attrs: {},
-                        content: Buffer.from([sock.getPlatformId(sock.browser[1])])
+                        content: Buffer.from([1]) // 1 = Chrome
                     },
                     {
                         tag: 'companion_platform_display',
                         attrs: {},
-                        content: Buffer.from(`${sock.browser[1]} (${sock.browser[0]})`)
+                        content: Buffer.from('Chrome (Ubuntu)')
                     },
                     {
                         tag: 'link_code_pairing_nonce',
@@ -99,7 +113,9 @@ async function startWhatsAppBot() {
     sock.ev.on('creds.update', saveCreds);
 
     // Load messages to store
-    store.bind(sock.ev);
+    if (store) {
+        store.bind(sock.ev);
+    }
 
     // Connection events
     sock.ev.on('connection.update', (update) => {
@@ -134,7 +150,7 @@ async function startWhatsAppBot() {
         const text = messageType === 'conversation' 
             ? msg.message.conversation 
             : messageType === 'extendedTextMessage' 
-                ? msg.message.extendedTextMessage.text 
+                ? msg.message.extendedTextMessage?.text 
                 : '';
 
         if (text) {
